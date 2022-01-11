@@ -1,0 +1,122 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import argparse
+import urlparse
+import stat
+import threading
+import queue
+import logging
+import commands
+
+import gfal2
+
+logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %H:%M:%S')
+
+log = logging.getLogger(__name__)
+
+def gfal2_walk(ctx, topurl, topdown=True):
+    """os.walk with gfal2."""
+    try:
+        entries = [f for f in ctx.listdir(topurl) if f != '.' and f != '..']
+    except gfal2.GError:
+        return
+
+    dirs = []
+    files = []
+    sizes = []
+    for entry in entries:
+        url = topurl + '/' + entry
+        try:
+            fstat = ctx.stat(url)
+        except gfal2.GError as e:
+            log.error('Error stating %s: %s', url, e)
+            continue
+        if stat.S_ISDIR(fstat.st_mode):
+            dirs.append(entry)
+        else:
+            files.append(entry)
+            sizes.append(fstat.st_size)
+
+    if topdown:
+        yield topurl, dirs, files, sizes
+
+    for dir in dirs:
+        url = topurl + '/' + dir
+        for x in gfal2_walk(ctx, url, topdown):
+            yield x
+
+    if not topdown:
+        yield topurl, dirs, files, sizes
+
+def copy_worker():
+    ctx = gfal2.creat_context()
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        src_url, dst_url = item
+        log.info('Copying: %s - %s', src_url, dst_url)
+        params = ctx.transfer_parameters()
+        params.overwrite = True
+        params.timeout = 300
+        try:
+            r = ctx.filecopy(params, src_url, dst_url)
+        except gfal2.GError as e:
+            log.error('Copy failed for %s: %s', src_url, e)
+#        status, output = commands.getstatusoutput('xrdcp -f -N %s %s' % (src_url, dst_url))
+#        if status:
+#            log.error('Copy failed for %s: %s', src_url, output)
+   
+        q.task_done()
+
+def main(source, destination, force, workers):
+
+    log.setLevel(logging.DEBUG)
+
+    log.debug('Starting %d workers', workers)
+    threads = []
+    for i in range(workers):
+        t = threading.Thread(target=copy_worker)
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    global q
+    q = queue.Queue()
+    ctx = gfal2.creat_context()
+
+    for root, _dirs, files, sizes in gfal2_walk(ctx, source):
+        for file, size in zip(files, sizes):
+            src_url = root + '/' + file
+            dst_url = destination + '/' + root[len(source):] + '/' + file
+            # log.info('To be copied: %s - %s', src_url, dst_url)
+            try:
+                fstat = ctx.stat(dst_url)
+                copy = fstat.st_size != size
+            except gfal2.GError:
+                copy = True
+            if copy:
+                q.put((src_url, dst_url))
+
+    q.join()
+    for i in range(workers):
+        q.put(None)
+    for t in threads:
+        t.join()
+            
+    
+            
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(description='Sync folders using GFAL2.')
+    parser.add_argument('source', metavar="URL", help="Source directory" )
+    parser.add_argument('destination', metavar="URL", help="Destination directory")
+    parser.add_argument('-f', '--force', action="store_true", default=False, help="Overwrite destination files.")
+    parser.add_argument('-w','--workers', type=int, default=4, help="Number of workers.")
+
+    args = parser.parse_args()
+
+    main(args.source, args.destination, args.force, args.workers)
